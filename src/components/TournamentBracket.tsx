@@ -7,7 +7,7 @@ import { CompactMatch } from './CompactMatch';
 import { AddPlayerModal } from './AddPlayerModal';
 
 import { supabase } from '@/lib/supabase';
-import { setMatchWinnerAndAdvance, cancelMatchWinner } from '@/lib/tournament';
+import { setMatchWinnerAndAdvance, cancelMatchWinner, setMatchPlaying } from '@/lib/tournament';
 import Link from 'next/link';
 import TournamentNavigation from './TournamentNavigation';
 import GrandFinalEmblem from './GrandFinalEmblem';
@@ -33,61 +33,41 @@ export default function TournamentBracket() {
   const mainRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
-    fetchTournamentData();
-    checkAdminSession();
-    supabase.from('drawing_config').select('capacity').maybeSingle().then(({ data }) => {
-      if (data) setDrawingCapacity(data.capacity);
-    });
-  }, []);
-
-  const checkAdminSession = async () => {
-    try {
-      const res = await fetch('/api/admin/check');
-      const data = await res.json();
-      setIsAdmin(data.isAdmin === true);
-    } catch {
-      // ignore
-    }
-  };
-
-  const fetchTournamentData = async () => {
-    try {
-      const [{ data: playerData }, { data: matchData }, { data: teamData }] = await Promise.all([
-        supabase.from('players').select('*').order('slot', { ascending: true }),
-        supabase.from('matches').select('*'),
-        supabase.from('teams').select('*').order('name', { ascending: true }),
-      ]);
-
+    let active = true;
+    Promise.all([
+      supabase.from('players').select('*').order('slot', { ascending: true }),
+      supabase.from('matches').select('*'),
+      supabase.from('teams').select('*').order('name', { ascending: true }),
+    ]).then(([{ data: playerData }, { data: matchData }, { data: teamData }]) => {
+      if (!active) return;
       const tList = (teamData as Team[]) || [];
       setTeams(tList);
-
-      const teamMap: Record<string, Team> = {};
-      tList.forEach((t) => {
-        teamMap[t.id] = t;
-      });
-
-      if (playerData) {
-        const pMap: Record<number, Player> = {};
-        playerData.forEach((p: Player) => {
-          pMap[p.slot] = {
-            ...p,
-            team: p.team_id ? teamMap[p.team_id] || null : null,
-          };
-        });
-        setPlayers(pMap);
-      }
-
-      if (matchData) {
-        const mMap: Record<string, Match> = {};
-        matchData.forEach((m: Match) => {
-          mMap[m.id] = m;
-        });
-        setMatches(mMap);
-      }
-    } catch (err) {
-      console.error('Error fetching tournament data:', err);
-    }
-  };
+      const teamMap = Object.fromEntries(tList.map(team => [team.id, team]));
+      if (playerData) setPlayers(Object.fromEntries(playerData.map((player: Player) => [player.slot, {
+        ...player, team: player.team_id ? teamMap[player.team_id] || null : null,
+      }])));
+      if (matchData) setMatches(Object.fromEntries(matchData.map((match: Match) => [match.id, match])));
+    }).catch(error => console.error('Error fetching tournament data:', error));
+    fetch('/api/admin/check').then(response => response.json()).then(data => {
+      if (active) setIsAdmin(data.isAdmin === true);
+    }).catch(() => {});
+    supabase.from('drawing_config').select('capacity').maybeSingle().then(({ data }) => {
+      if (active && data) setDrawingCapacity(data.capacity);
+    });
+    return () => { active = false; };
+  }, []);
+  useEffect(() => {
+    let active = true;
+    const refreshMatches = () => {
+      if (document.visibilityState !== 'visible') return;
+      Promise.resolve(supabase.from('matches').select('*')).then(({ data }) => {
+        if (active && data) setMatches(Object.fromEntries(data.map((match: Match) => [match.id, match])));
+      }).catch(() => { /* Keep the last bracket while offline. */ });
+    };
+    const interval = setInterval(refreshMatches, 5000);
+    window.addEventListener('focus', refreshMatches);
+    return () => { active = false; clearInterval(interval); window.removeEventListener('focus', refreshMatches); };
+  }, []);
 
   const emptySlots = Object.values(players)
     .filter((p) => p.slot <= (drawingCapacity || 128) && (!p.name || p.name.trim() === ''))
@@ -145,6 +125,12 @@ export default function TournamentBracket() {
     }
   };
 
+  const handleSetPlaying = async (round: number, matchNumber: number, playing: boolean) => {
+    if (!isAdmin) return;
+    const match = await setMatchPlaying(round, matchNumber, playing);
+    setMatches(prev => ({ ...prev, [match.id]: match }));
+  };
+
   const handleCancelWinner = async (round: number, matchNumber: number) => {
     if (!isAdmin) return;
     const result = await cancelMatchWinner(round, matchNumber, matches);
@@ -199,10 +185,10 @@ export default function TournamentBracket() {
           align={align}
           p1={players[p1Slot] || { slot: p1Slot, name: '' }}
           p2={players[p2Slot] || { slot: p2Slot, name: '' }}
-          winnerSlot={matchData?.winner_slot}
+          winnerSlot={matchData?.winner_slot} isPlaying={matchData?.is_playing}
           isAdmin={isAdmin}
           onSelectWinner={handleSelectWinner}
-          onCancelWinner={handleCancelWinner}
+          onCancelWinner={handleCancelWinner} onSetPlaying={handleSetPlaying}
           onOpenAddPlayer={(slot) => {
             setSelectedSlotForModal(slot);
             setIsAddModalOpen(true);
@@ -248,10 +234,10 @@ export default function TournamentBracket() {
                       align={side}
                       p1={p1Slot ? players[p1Slot] || { slot: p1Slot, name: '' } : undefined}
                       p2={p2Slot ? players[p2Slot] || { slot: p2Slot, name: '' } : undefined}
-                      winnerSlot={mData?.winner_slot}
+                      winnerSlot={mData?.winner_slot} isPlaying={mData?.is_playing}
                       isAdmin={isAdmin}
                       onSelectWinner={handleSelectWinner}
-                      onCancelWinner={handleCancelWinner}
+                      onCancelWinner={handleCancelWinner} onSetPlaying={handleSetPlaying}
                       onOpenAddPlayer={(slot) => {
                         setSelectedSlotForModal(slot);
                         setIsAddModalOpen(true);
@@ -282,10 +268,10 @@ export default function TournamentBracket() {
                       align={side}
                       p1={p1Slot ? players[p1Slot] || { slot: p1Slot, name: '' } : undefined}
                       p2={p2Slot ? players[p2Slot] || { slot: p2Slot, name: '' } : undefined}
-                      winnerSlot={mData?.winner_slot}
+                      winnerSlot={mData?.winner_slot} isPlaying={mData?.is_playing}
                       isAdmin={isAdmin}
                       onSelectWinner={handleSelectWinner}
-                      onCancelWinner={handleCancelWinner}
+                      onCancelWinner={handleCancelWinner} onSetPlaying={handleSetPlaying}
                       onOpenAddPlayer={(slot) => {
                         setSelectedSlotForModal(slot);
                         setIsAddModalOpen(true);
@@ -349,7 +335,7 @@ export default function TournamentBracket() {
 
       {/* ═══ MAIN CONTENT AREA ═══ */}
       <main ref={mainRef} style={{ flex: 1, overflowX: 'auto', overflowY: 'auto' }}>
-        {drawingCapacity ? <DrawingBracket capacity={drawingCapacity} players={players} matches={matches} isAdmin={isAdmin} onSelectWinner={handleSelectWinner} onCancelWinner={handleCancelWinner} onOpenAddPlayer={(slot) => { setSelectedSlotForModal(slot); setIsAddModalOpen(true); }} /> : viewMode === 'full' ? (
+        {drawingCapacity ? <DrawingBracket capacity={drawingCapacity} players={players} matches={matches} isAdmin={isAdmin} onSelectWinner={handleSelectWinner} onCancelWinner={handleCancelWinner} onSetPlaying={handleSetPlaying} onOpenAddPlayer={(slot) => { setSelectedSlotForModal(slot); setIsAddModalOpen(true); }} /> : viewMode === 'full' ? (
           /* FULL BRACKET TREE VIEW */
           <div style={{ padding: '20px 16px', display: 'flex', justifyContent: 'center', width: '100%', minWidth: 'max-content' }}>
             <div className="full-bracket">
@@ -374,10 +360,10 @@ export default function TournamentBracket() {
                         align="left"
                         p1={sfLeftP1}
                         p2={sfLeftP2}
-                        winnerSlot={sfLeftMatch?.winner_slot}
+                        winnerSlot={sfLeftMatch?.winner_slot} isPlaying={sfLeftMatch?.is_playing}
                         isAdmin={isAdmin}
                         onSelectWinner={handleSelectWinner}
-                        onCancelWinner={handleCancelWinner}
+                        onCancelWinner={handleCancelWinner} onSetPlaying={handleSetPlaying}
                         onOpenAddPlayer={(slot) => {
                           setSelectedSlotForModal(slot);
                           setIsAddModalOpen(true);
@@ -435,10 +421,10 @@ export default function TournamentBracket() {
                     align="left"
                     p1={finalP1}
                     p2={finalP2}
-                    winnerSlot={finalMatch?.winner_slot}
+                    winnerSlot={finalMatch?.winner_slot} isPlaying={finalMatch?.is_playing}
                     isAdmin={isAdmin}
                     onSelectWinner={handleSelectWinner}
-                    onCancelWinner={handleCancelWinner}
+                    onCancelWinner={handleCancelWinner} onSetPlaying={handleSetPlaying}
                     onOpenAddPlayer={(slot) => {
                       setSelectedSlotForModal(slot);
                       setIsAddModalOpen(true);
@@ -462,10 +448,10 @@ export default function TournamentBracket() {
                         align="right"
                         p1={sfRightP1}
                         p2={sfRightP2}
-                        winnerSlot={sfRightMatch?.winner_slot}
+                        winnerSlot={sfRightMatch?.winner_slot} isPlaying={sfRightMatch?.is_playing}
                         isAdmin={isAdmin}
                         onSelectWinner={handleSelectWinner}
-                        onCancelWinner={handleCancelWinner}
+                        onCancelWinner={handleCancelWinner} onSetPlaying={handleSetPlaying}
                         onOpenAddPlayer={(slot) => {
                           setSelectedSlotForModal(slot);
                           setIsAddModalOpen(true);

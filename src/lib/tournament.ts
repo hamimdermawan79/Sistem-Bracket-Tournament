@@ -1,6 +1,16 @@
 import { supabase } from './supabase';
 import { Match } from '@/types/tournament';
 
+export async function setMatchPlaying(round: number, matchNumber: number, playing: boolean): Promise<Match> {
+  const response = await fetch('/api/admin/matches', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ round, matchNumber, playing }),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Status bermain gagal disimpan.');
+  return data.match;
+}
+
 /**
  * Calculates the next round match ID, slot target (player1 or player2), and bracket side.
  */
@@ -50,6 +60,7 @@ export async function setMatchWinnerAndAdvance(
     player1_slot: currentMatch ? currentMatch.player1_slot : round === 1 ? (matchNum * 2) - 1 : null,
     player2_slot: currentMatch ? currentMatch.player2_slot : round === 1 ? matchNum * 2 : null,
     winner_slot: winnerSlot,
+    is_playing: false,
   };
 
   const { error: currentErr } = await supabase.from('matches').upsert(currentUpdate);
@@ -73,11 +84,14 @@ export async function setMatchWinnerAndAdvance(
       player1_slot: existingNext?.player1_slot || null,
       player2_slot: existingNext?.player2_slot || null,
       winner_slot: existingNext?.winner_slot || null,
+      is_playing: existingNext?.is_playing || false,
     };
 
     if (nextInfo.isPlayer1) {
+      if (updateData.player1_slot !== winnerSlot) updateData.is_playing = false;
       updateData.player1_slot = winnerSlot;
     } else {
+      if (updateData.player2_slot !== winnerSlot) updateData.is_playing = false;
       updateData.player2_slot = winnerSlot;
     }
 
@@ -112,6 +126,7 @@ export async function cancelMatchWinner(
   const currentUpdate: Match = {
     ...currentMatch,
     winner_slot: null,
+    is_playing: false,
   };
 
   const { error: currentErr } = await supabase.from('matches').upsert(currentUpdate);
@@ -151,6 +166,7 @@ export async function cancelMatchWinner(
     }
 
     if (modified) {
+      nextUpdate.is_playing = false;
       await supabase.from('matches').upsert(nextUpdate);
       updatedMatches.push(nextUpdate);
       checkRound = nextInfo.nextRound;

@@ -1,4 +1,11 @@
 export interface DrawingEntry { id: string; name: string; }
+export interface DrawingResult {
+  player_id: string;
+  name: string;
+  slot: number;
+  wheel: number;
+  team_id: string | null;
+}
 
 export interface DrawingState {
   id: number;
@@ -10,6 +17,7 @@ export interface DrawingState {
   entries: DrawingEntry[];
   retry_player_id: string | null;
   pending: { player_id: string; name: string; slot: number; wheel: number } | null;
+  pending_batch: DrawingResult[];
   retry_name: string | null;
   revision: number;
 }

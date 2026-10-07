@@ -12,7 +12,7 @@ export async function localSql(sql: string) {
   const bin = process.env.LOCAL_PG_BIN || 'C:\\Program Files\\PostgreSQL\\16\\bin';
   try {
     const { stdout } = await run(path.join(bin, process.platform === 'win32' ? 'psql.exe' : 'psql'), [
-      '-h', '127.0.0.1', '-p', process.env.LOCAL_PG_PORT || '55439', '-U', 'postgres', '-d', 'postgres',
+      '-h', '127.0.0.1', '-p', process.env.LOCAL_PG_PORT || '55439', '-U', 'postgres', '-d', process.env.LOCAL_PG_DATABASE || 'postgres',
       '-X', '-q', '-t', '-A', '-v', 'ON_ERROR_STOP=1', '-c', sql,
     ], { windowsHide: true, maxBuffer: 4 * 1024 * 1024 });
     return stdout.trim() ? JSON.parse(stdout.trim()) : null;
@@ -24,6 +24,6 @@ export async function localSql(sql: string) {
 export async function localDrawingData() {
   const state = await localSql("SELECT row_to_json(s) FROM live_drawing s WHERE id=1");
   const players = await localSql("SELECT coalesce(json_agg(p ORDER BY slot),'[]') FROM (SELECT slot,name FROM players) p");
-  const teams = await localSql("SELECT coalesce(json_agg(t ORDER BY name),'[]') FROM (SELECT id,name FROM teams) t");
+  const teams = await localSql("SELECT coalesce(json_agg(t ORDER BY name),'[]') FROM (SELECT id,name,logo_url FROM teams) t");
   return { state, players, teams };
 }
