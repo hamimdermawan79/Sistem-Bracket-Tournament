@@ -6,7 +6,8 @@ import { BracketMatch } from './BracketMatch';
 import { AddPlayerModal } from './AddPlayerModal';
 
 import { supabase } from '@/lib/supabase';
-import { setMatchWinnerAndAdvance, cancelMatchWinner } from '@/lib/tournament';
+import { setMatchWinnerAndAdvance, cancelMatchWinner, setMatchPlaying } from '@/lib/tournament';
+import { firstDrawingRound } from '@/lib/drawing';
 import Link from 'next/link';
 import TournamentNavigation from './TournamentNavigation';
 import GrandFinalEmblem from './GrandFinalEmblem';
@@ -21,66 +22,51 @@ interface RoundPageProps {
 
 
 
-export default function RoundPage({ roundNumber, roundLabel, totalMatches, prevRoundLabel }: RoundPageProps) {
+export default function RoundPage({ roundNumber, roundLabel, totalMatches }: RoundPageProps) {
   const [players, setPlayers] = useState<Record<number, Player>>({});
   const [matches, setMatches] = useState<Record<string, Match>>({});
   const [teams, setTeams] = useState<Team[]>([]);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [firstRound, setFirstRound] = useState(1);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [selectedSlotForModal, setSelectedSlotForModal] = useState<number | null>(null);
 
   useEffect(() => {
-    fetchData();
-    checkAdminSession();
-  }, []);
-
-  const checkAdminSession = async () => {
-    try {
-      const res = await fetch('/api/admin/check');
-      const data = await res.json();
-      setIsAdmin(data.isAdmin === true);
-    } catch {
-      // ignore
-    }
-  };
-
-  const fetchData = async () => {
-    try {
-      const [{ data: pd }, { data: md }, { data: td }] = await Promise.all([
-        supabase.from('players').select('*').order('slot', { ascending: true }),
-        supabase.from('matches').select('*'),
-        supabase.from('teams').select('*').order('name', { ascending: true }),
-      ]);
-
-      const tList = (td as Team[]) || [];
+    let active = true;
+    Promise.all([
+      supabase.from('players').select('*').order('slot', { ascending: true }),
+      supabase.from('matches').select('*'),
+      supabase.from('teams').select('*').order('name', { ascending: true }),
+    ]).then(([{ data: playerData }, { data: matchData }, { data: teamData }]) => {
+      if (!active) return;
+      const tList = (teamData as Team[]) || [];
       setTeams(tList);
-
-      const teamMap: Record<string, Team> = {};
-      tList.forEach((t) => {
-        teamMap[t.id] = t;
-      });
-
-      if (pd) {
-        const m: Record<number, Player> = {};
-        pd.forEach((p: Player) => {
-          m[p.slot] = {
-            ...p,
-            team: p.team_id ? teamMap[p.team_id] || null : null,
-          };
-        });
-        setPlayers(m);
-      }
-      if (md) {
-        const mm: Record<string, Match> = {};
-        md.forEach((m: Match) => {
-          mm[m.id] = m;
-        });
-        setMatches(mm);
-      }
-    } catch (err) {
-      console.error('Error fetching round data:', err);
-    }
-  };
+      const teamMap = Object.fromEntries(tList.map(team => [team.id, team]));
+      if (playerData) setPlayers(Object.fromEntries(playerData.map((player: Player) => [player.slot, {
+        ...player, team: player.team_id ? teamMap[player.team_id] || null : null,
+      }])));
+      if (matchData) setMatches(Object.fromEntries(matchData.map((match: Match) => [match.id, match])));
+    }).catch(error => console.error('Error fetching tournament data:', error));
+    fetch('/api/admin/check').then(response => response.json()).then(data => {
+      if (active) setIsAdmin(data.isAdmin === true);
+    }).catch(() => {});
+    supabase.from('drawing_config').select('capacity').maybeSingle().then(({ data }) => {
+      if (active && data) setFirstRound(firstDrawingRound(data.capacity));
+    });
+    return () => { active = false; };
+  }, []);
+  useEffect(() => {
+    let active = true;
+    const refreshMatches = () => {
+      if (document.visibilityState !== 'visible') return;
+      Promise.resolve(supabase.from('matches').select('*')).then(({ data }) => {
+        if (active && data) setMatches(Object.fromEntries(data.map((match: Match) => [match.id, match])));
+      }).catch(() => { /* Keep the last bracket while offline. */ });
+    };
+    const interval = setInterval(refreshMatches, 5000);
+    window.addEventListener('focus', refreshMatches);
+    return () => { active = false; clearInterval(interval); window.removeEventListener('focus', refreshMatches); };
+  }, []);
 
   const emptySlots = Object.values(players)
     .filter((p) => !p.name || p.name.trim() === '')
@@ -138,6 +124,12 @@ export default function RoundPage({ roundNumber, roundLabel, totalMatches, prevR
     }
   };
 
+  const handleSetPlaying = async (round: number, matchNumber: number, playing: boolean) => {
+    if (!isAdmin) return;
+    const match = await setMatchPlaying(round, matchNumber, playing);
+    setMatches(prev => ({ ...prev, [match.id]: match }));
+  };
+
   const handleCancelWinner = async (round: number, matchNumber: number) => {
     if (!isAdmin) return;
     const result = await cancelMatchWinner(round, matchNumber, matches);
@@ -180,12 +172,14 @@ export default function RoundPage({ roundNumber, roundLabel, totalMatches, prevR
         round={roundNumber}
         matchNumber={matchNum}
         align={align}
+        arena={roundNumber >= 2 && roundNumber <= 5}
+        firstRound={firstRound}
         p1={p1}
         p2={p2}
-        winnerSlot={mData?.winner_slot}
+        winnerSlot={mData?.winner_slot} isPlaying={mData?.is_playing}
         isAdmin={isAdmin}
         onSelectWinner={handleSelectWinner}
-        onCancelWinner={handleCancelWinner}
+        onCancelWinner={handleCancelWinner} onSetPlaying={handleSetPlaying}
         onOpenAddPlayer={(slot) => {
           setSelectedSlotForModal(slot);
           setIsAddModalOpen(true);
@@ -228,8 +222,8 @@ export default function RoundPage({ roundNumber, roundLabel, totalMatches, prevR
       </TournamentNavigation>
 
       {/* ═══ MAIN CONTENT ═══ */}
-      <main style={{ flex: 1, padding: '32px 16px 60px' }}>
-        {!isFinal && !isSemi && <h2 className="round-name-heading">{roundNumber === 5 ? 'Quarter Final' : `Babak ${roundLabel}`}</h2>}
+      <main className="round-stage">
+        {!isFinal && !isSemi && <header className="round-stage-heading"><div><span>AMMA X SAVE</span><h2>{roundNumber === 5 ? 'Perempat final' : roundLabel}</h2></div><span className="round-stage-count">{totalMatches} pertandingan</span></header>}
         {/* Layout for Grand Final */}
         {isFinal ? (
           <section className="final-showcase" aria-label="Grand Final">
@@ -251,7 +245,7 @@ export default function RoundPage({ roundNumber, roundLabel, totalMatches, prevR
             {(['left', 'right'] as const).map((side, i) => {
               const count = i ? rightCount : leftCount;
               if (!count) return null;
-              return <section className={`round-group round-group-${side}`} key={side}><div className="round-match-list">{Array.from({ length: count }, (_, j) => renderRoundMatchCard(j + 1 + (i ? leftCount : 0), side))}</div></section>;
+              return <section className={`round-group round-group-${side}`} key={side} aria-label={`Bracket ${i ? 'kanan' : 'kiri'}`}><header className="round-group-heading"><h3>Bracket {i ? 'kanan' : 'kiri'}</h3><span>{count} match</span></header><div className="round-match-list">{Array.from({ length: count }, (_, j) => renderRoundMatchCard(j + 1 + (i ? leftCount : 0), side))}</div></section>;
             })}
           </div>
         )}

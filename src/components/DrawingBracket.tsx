@@ -6,7 +6,7 @@ import { ComponentProps } from 'react';
 import GrandFinalEmblem from './GrandFinalEmblem';
 
 
-type Props = { capacity: number; players: Record<number, Player>; matches: Record<string, Match> } & Pick<ComponentProps<typeof CompactMatch>, 'isAdmin' | 'onSelectWinner' | 'onCancelWinner' | 'onOpenAddPlayer'>;
+type Props = { capacity: number; players: Record<number, Player>; matches: Record<string, Match> } & Pick<ComponentProps<typeof CompactMatch>, 'isAdmin' | 'onSelectWinner' | 'onCancelWinner' | 'onSetPlaying' | 'onOpenAddPlayer'>;
 export default function DrawingBracket({ capacity, players, matches, ...handlers }: Props) {
   const first = firstDrawingRound(capacity);
   const treeHeight = Math.max(400, 2 ** (6 - first) * 64);
@@ -28,7 +28,7 @@ export default function DrawingBracket({ capacity, players, matches, ...handlers
       {Array.from({ length: count }, (_, i) => {
       const number = start + i; const match = matches[`R${round}_M${number}`];
       const player = (slot?: number | null) => slot ? players[slot] || { slot, name: '' } : undefined;
-      return <div className="drawing-tree-node" style={{ top: (i + .5) * step }} key={number}>{side === 'final' && <GrandFinalEmblem className="tree-final-emblem" />}<CompactMatch {...handlers} round={round} matchNumber={number} align={side === 'right' ? 'right' : 'left'} p1={player(match?.player1_slot)} p2={player(match?.player2_slot)} winnerSlot={match?.winner_slot} /></div>;
+      return <div className="drawing-tree-node" style={{ top: (i + .5) * step }} key={number}>{side === 'final' && <GrandFinalEmblem className="tree-final-emblem" />}<CompactMatch {...handlers} firstRound={first} round={round} matchNumber={number} align={side === 'right' ? 'right' : 'left'} p1={player(match?.player1_slot)} p2={player(match?.player2_slot)} winnerSlot={match?.winner_slot} isPlaying={match?.is_playing} /></div>;
     })}</div></div>;
   }
   return <div className="drawing-tree"><div className="drawing-half">{Array.from({ length: 7 - first }, (_, i) => column(first + i, 'left'))}</div>{column(7, 'final')}<div className="drawing-half">{Array.from({ length: 7 - first }, (_, i) => column(6 - i, 'right'))}</div></div>;

@@ -1,29 +1,11 @@
--- Run once in the Supabase SQL Editor. No existing players are removed.
-CREATE TABLE IF NOT EXISTS public.live_drawing (
-  id integer PRIMARY KEY CHECK (id = 1),
-  capacity integer NOT NULL CHECK (capacity BETWEEN 2 AND 128),
-  wheel_count integer NOT NULL,
-  initial_count integer NOT NULL,
-  names jsonb NOT NULL DEFAULT '[]',
-  pending jsonb,
-  retry_name text,
-  revision integer NOT NULL DEFAULT 0
-);
-ALTER TABLE public.live_drawing ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.live_drawing ADD COLUMN IF NOT EXISTS spin_duration_ms integer NOT NULL DEFAULT 4200 CHECK (spin_duration_ms BETWEEN 500 AND 15000);
-ALTER TABLE public.live_drawing ADD COLUMN IF NOT EXISTS entries jsonb NOT NULL DEFAULT '[]';
-ALTER TABLE public.live_drawing ADD COLUMN IF NOT EXISTS retry_player_id text;
+-- Run after 001 (and 002 if already used), in the intended Supabase project.
+-- Existing players and matches are preserved. Unsaved single results become a batch.
+BEGIN;
 ALTER TABLE public.live_drawing ADD COLUMN IF NOT EXISTS pending_batch jsonb NOT NULL DEFAULT '[]';
-UPDATE live_drawing SET entries = (SELECT coalesce(jsonb_agg(jsonb_build_object('id', gen_random_uuid()::text, 'name', n) ORDER BY ordinal), '[]') FROM jsonb_array_elements_text(names) WITH ORDINALITY AS x(n,ordinal)) WHERE jsonb_array_length(entries)=0 AND jsonb_array_length(names)>0;
-UPDATE live_drawing SET pending = pending || jsonb_build_object('player_id', (SELECT e->>'id' FROM jsonb_array_elements(entries) e WHERE e->>'name'=pending->>'name' LIMIT 1)) WHERE pending IS NOT NULL AND NOT pending ? 'player_id';
-UPDATE live_drawing SET retry_player_id=(SELECT e->>'id' FROM jsonb_array_elements(entries) e WHERE e->>'name'=retry_name LIMIT 1) WHERE retry_name IS NOT NULL AND retry_player_id IS NULL;
-GRANT ALL ON public.live_drawing TO service_role;
-GRANT SELECT ON public.live_drawing TO anon, authenticated;
-DROP POLICY IF EXISTS "Read drawing bracket configuration" ON public.live_drawing;
--- Names and pending results are only accessible through the admin API.
-CREATE OR REPLACE VIEW public.drawing_config WITH (security_barrier = true) AS
-SELECT capacity, wheel_count FROM public.live_drawing;
-GRANT SELECT ON public.drawing_config TO anon, authenticated;
+UPDATE public.live_drawing
+SET pending_batch = jsonb_build_array(pending || jsonb_build_object('team_id', NULL)),
+    pending = NULL, retry_name = NULL, retry_player_id = NULL, revision = revision + 1
+WHERE pending IS NOT NULL AND jsonb_array_length(pending_batch) = 0;
 
 CREATE OR REPLACE FUNCTION public.live_drawing_action(payload jsonb)
 RETURNS void LANGUAGE plpgsql SET search_path = public AS $$
@@ -158,3 +140,91 @@ BEGIN
 END $$;
 REVOKE ALL ON FUNCTION public.live_drawing_action(jsonb) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.live_drawing_action(jsonb) TO service_role;
+
+CREATE OR REPLACE FUNCTION public.live_drawing_batch_action(payload jsonb)
+RETURNS void LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE
+  s live_drawing%ROWTYPE;
+  action text := payload->>'action';
+  selection jsonb; result jsonb; results jsonb := '[]';
+  player_id text; player_name text; team teams.id%TYPE;
+  wheel integer; lo integer; hi integer; picked integer; previous_slot integer;
+  target_index integer;
+BEGIN
+  PERFORM pg_advisory_xact_lock(728194);
+  LOCK TABLE players, matches IN SHARE ROW EXCLUSIVE MODE;
+  SELECT * INTO s FROM live_drawing WHERE id=1 FOR UPDATE;
+  IF s.id IS NULL THEN RAISE EXCEPTION 'Siapkan drawing terlebih dahulu.'; END IF;
+  IF (payload->>'revision')::integer IS DISTINCT FROM s.revision THEN
+    RAISE EXCEPTION 'Data berubah. Muat ulang drawing.';
+  END IF;
+  IF s.pending IS NOT NULL THEN RAISE EXCEPTION 'Selesaikan hasil spin sebelumnya.'; END IF;
+
+  IF action = 'spin_all' THEN
+    IF jsonb_array_length(s.pending_batch) > 0 THEN RAISE EXCEPTION 'Simpan seluruh hasil spin terlebih dahulu.'; END IF;
+    IF jsonb_typeof(payload->'selections') IS DISTINCT FROM 'array' THEN RAISE EXCEPTION 'Pilih pemain untuk wheel yang akan diputar.'; END IF;
+    IF jsonb_array_length(payload->'selections') NOT BETWEEN 1 AND s.wheel_count THEN RAISE EXCEPTION 'Jumlah pilihan wheel tidak valid.'; END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_array_elements(payload->'selections') e GROUP BY e->>'player_id' HAVING count(*)>1)
+      OR EXISTS (SELECT 1 FROM jsonb_array_elements(payload->'selections') e GROUP BY (e->>'wheel')::integer HAVING count(*)>1) THEN
+      RAISE EXCEPTION 'Setiap pemain dan wheel hanya boleh dipilih sekali.';
+    END IF;
+    FOR selection IN SELECT e FROM jsonb_array_elements(payload->'selections') e ORDER BY (e->>'wheel')::integer LOOP
+      wheel := (selection->>'wheel')::integer;
+      player_id := selection->>'player_id';
+      IF wheel IS NULL OR wheel NOT BETWEEN 0 AND s.wheel_count-1 THEN RAISE EXCEPTION 'Wheel tidak valid.'; END IF;
+      SELECT e->>'name' INTO player_name FROM jsonb_array_elements(s.entries) e WHERE e->>'id'=player_id;
+      IF player_name IS NULL THEN RAISE EXCEPTION 'Pemain tidak tersedia.'; END IF;
+      lo := floor(wheel::numeric*s.capacity/s.wheel_count)::integer+1;
+      hi := floor((wheel+1)::numeric*s.capacity/s.wheel_count)::integer;
+      SELECT slot INTO picked FROM players WHERE slot BETWEEN lo AND hi AND coalesce(trim(name),'')='' ORDER BY random() LIMIT 1;
+      IF picked IS NULL THEN RAISE EXCEPTION 'Wheel % sudah habis.', wheel+1; END IF;
+      results := results || jsonb_build_array(jsonb_build_object('player_id',player_id,'name',player_name,'wheel',wheel,'slot',picked,'team_id',NULL));
+    END LOOP;
+    UPDATE live_drawing SET pending_batch=results, retry_name=NULL, retry_player_id=NULL, revision=revision+1 WHERE id=1;
+    RETURN;
+  END IF;
+
+  IF jsonb_array_length(s.pending_batch)=0 THEN RAISE EXCEPTION 'Belum ada hasil spin.'; END IF;
+  IF action IN ('retry_one','batch_team') THEN
+    SELECT e, ordinal::integer-1 INTO result, target_index FROM jsonb_array_elements(s.pending_batch) WITH ORDINALITY x(e,ordinal) WHERE e->>'player_id'=payload->>'player_id';
+    IF result IS NULL THEN RAISE EXCEPTION 'Hasil pemain tidak tersedia.'; END IF;
+    IF action='retry_one' THEN
+      wheel := (result->>'wheel')::integer;
+      previous_slot := (result->>'slot')::integer;
+      lo := floor(wheel::numeric*s.capacity/s.wheel_count)::integer+1;
+      hi := floor((wheel+1)::numeric*s.capacity/s.wheel_count)::integer;
+      SELECT slot INTO picked FROM players
+      WHERE slot BETWEEN lo AND hi AND coalesce(trim(name),'')='' AND slot<>previous_slot
+        AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(s.pending_batch) e WHERE (e->>'slot')::integer=players.slot)
+      ORDER BY random() LIMIT 1;
+      IF picked IS NULL THEN RAISE EXCEPTION 'Tidak ada nomor lain yang tersedia di wheel ini.'; END IF;
+      result := result || jsonb_build_object('slot',picked);
+    ELSE
+      IF payload->'team_id' = 'null'::jsonb THEN
+        result := result || jsonb_build_object('team_id',NULL);
+      ELSE
+        SELECT id INTO team FROM teams WHERE id::text=payload->>'team_id' FOR KEY SHARE;
+        IF team IS NULL THEN RAISE EXCEPTION 'Tim tidak tersedia. Pilih tim yang sudah terdaftar.'; END IF;
+        result := result || jsonb_build_object('team_id',team);
+      END IF;
+    END IF;
+    UPDATE live_drawing SET pending_batch=jsonb_set(pending_batch,ARRAY[target_index::text],result), revision=revision+1 WHERE id=1;
+  ELSIF action='save_all' THEN
+    FOR result IN SELECT e FROM jsonb_array_elements(s.pending_batch) e LOOP
+      SELECT id INTO team FROM teams WHERE id::text=result->>'team_id' FOR KEY SHARE;
+      IF team IS NULL THEN RAISE EXCEPTION 'Pilih tim untuk semua pemain sebelum menyimpan.'; END IF;
+      UPDATE players SET name=result->>'name', team_id=team, updated_at=now()
+      WHERE slot=(result->>'slot')::integer AND coalesce(trim(name),'')='';
+      IF NOT FOUND THEN RAISE EXCEPTION 'Slot sudah terisi. Ulang spin pemain tersebut.'; END IF;
+    END LOOP;
+    SELECT coalesce(jsonb_agg(e),'[]') INTO results FROM jsonb_array_elements(s.entries) e
+    WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements(s.pending_batch) b WHERE b->>'player_id'=e->>'id');
+    UPDATE live_drawing SET entries=results, names=(SELECT coalesce(jsonb_agg(e->>'name'),'[]') FROM jsonb_array_elements(results) e),
+      pending_batch='[]', revision=revision+1 WHERE id=1;
+  ELSE
+    RAISE EXCEPTION 'Aksi tidak valid.';
+  END IF;
+END $$;
+REVOKE ALL ON FUNCTION public.live_drawing_batch_action(jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.live_drawing_batch_action(jsonb) TO service_role;
+COMMIT;

@@ -15,7 +15,7 @@ mkdirSync(path.dirname(data), { recursive: true });
 if (!existsSync(path.join(data, 'PG_VERSION'))) run('initdb', ['-D', data, '-U', 'postgres', '-A', 'trust', '-E', 'UTF8']);
 const status = spawnSync(executable('pg_ctl'), ['-D', data, 'status'], { windowsHide: true, stdio: 'ignore' });
 if (status.status !== 0) run('pg_ctl', ['-D', data, '-l', path.join(root, '.local-tournament', 'postgres.log'), '-o', `-h 127.0.0.1 -p ${port}`, 'start']);
-run('psql', ['-h', '127.0.0.1', '-p', port, '-U', 'postgres', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1', '-f', 'scripts/local-schema.sql', '-f', 'migrations/001_live_drawing.sql']);
+run('psql', ['-h', '127.0.0.1', '-p', port, '-U', 'postgres', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1', '-f', 'scripts/local-schema.sql', '-f', 'migrations/001_live_drawing.sql', '-f', 'migrations/003_live_drawing_batch.sql', '-f', 'migrations/004_match_playing.sql']);
 console.log('Preview lokal: data tersimpan di .local-tournament dan tidak memakai Supabase.');
 const child = spawn(process.execPath, [path.join(root, 'node_modules', 'next', 'dist', 'bin', 'next'), 'dev', '--hostname', '127.0.0.1', '--port', process.env.PORT || '3000'], {
   stdio: 'inherit', windowsHide: true,

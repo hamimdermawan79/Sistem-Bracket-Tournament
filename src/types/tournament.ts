@@ -22,6 +22,7 @@ export interface Match {
   player1_slot: number | null;
   player2_slot: number | null;
   winner_slot: number | null;
+  is_playing?: boolean;
   player1_name?: string;
   player2_name?: string;
   player1_team?: Team | null;

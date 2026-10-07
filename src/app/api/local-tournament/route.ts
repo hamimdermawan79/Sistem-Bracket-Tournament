@@ -3,7 +3,7 @@ import { localSql, sqlLiteral } from '@/lib/localDatabase';
 
 const tables: Record<string, string[]> = {
   players: ['slot', 'name', 'team_id', 'updated_at'],
-  matches: ['id', 'round', 'match_number', 'bracket_side', 'player1_slot', 'player2_slot', 'winner_slot', 'updated_at'],
+  matches: ['id', 'round', 'match_number', 'bracket_side', 'player1_slot', 'player2_slot', 'winner_slot', 'is_playing', 'updated_at'],
   teams: ['id', 'name', 'logo_url', 'created_at', 'updated_at'],
   drawing_config: ['capacity', 'wheel_count'],
 };

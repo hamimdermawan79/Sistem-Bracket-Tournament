@@ -1,30 +1,8 @@
--- Run once in the Supabase SQL Editor. No existing players are removed.
-CREATE TABLE IF NOT EXISTS public.live_drawing (
-  id integer PRIMARY KEY CHECK (id = 1),
-  capacity integer NOT NULL CHECK (capacity BETWEEN 2 AND 128),
-  wheel_count integer NOT NULL,
-  initial_count integer NOT NULL,
-  names jsonb NOT NULL DEFAULT '[]',
-  pending jsonb,
-  retry_name text,
-  revision integer NOT NULL DEFAULT 0
-);
-ALTER TABLE public.live_drawing ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.live_drawing ADD COLUMN IF NOT EXISTS spin_duration_ms integer NOT NULL DEFAULT 4200 CHECK (spin_duration_ms BETWEEN 500 AND 15000);
-ALTER TABLE public.live_drawing ADD COLUMN IF NOT EXISTS entries jsonb NOT NULL DEFAULT '[]';
-ALTER TABLE public.live_drawing ADD COLUMN IF NOT EXISTS retry_player_id text;
-ALTER TABLE public.live_drawing ADD COLUMN IF NOT EXISTS pending_batch jsonb NOT NULL DEFAULT '[]';
-UPDATE live_drawing SET entries = (SELECT coalesce(jsonb_agg(jsonb_build_object('id', gen_random_uuid()::text, 'name', n) ORDER BY ordinal), '[]') FROM jsonb_array_elements_text(names) WITH ORDINALITY AS x(n,ordinal)) WHERE jsonb_array_length(entries)=0 AND jsonb_array_length(names)>0;
-UPDATE live_drawing SET pending = pending || jsonb_build_object('player_id', (SELECT e->>'id' FROM jsonb_array_elements(entries) e WHERE e->>'name'=pending->>'name' LIMIT 1)) WHERE pending IS NOT NULL AND NOT pending ? 'player_id';
-UPDATE live_drawing SET retry_player_id=(SELECT e->>'id' FROM jsonb_array_elements(entries) e WHERE e->>'name'=retry_name LIMIT 1) WHERE retry_name IS NOT NULL AND retry_player_id IS NULL;
-GRANT ALL ON public.live_drawing TO service_role;
-GRANT SELECT ON public.live_drawing TO anon, authenticated;
-DROP POLICY IF EXISTS "Read drawing bracket configuration" ON public.live_drawing;
--- Names and pending results are only accessible through the admin API.
-CREATE OR REPLACE VIEW public.drawing_config WITH (security_barrier = true) AS
-SELECT capacity, wheel_count FROM public.live_drawing;
-GRANT SELECT ON public.drawing_config TO anon, authenticated;
-
+-- Run in the Supabase SQL Editor for the intended tournament project.
+-- Requires migrations/001_live_drawing.sql to have been applied.
+-- Only replaces the drawing function; running this file does not reset data.
+-- A confirmed reset still clears the single bracket stored in this project.
+BEGIN;
 CREATE OR REPLACE FUNCTION public.live_drawing_action(payload jsonb)
 RETURNS void LANGUAGE plpgsql SET search_path = public AS $$
 DECLARE
@@ -39,9 +17,6 @@ BEGIN
   PERFORM pg_advisory_xact_lock(728194);
   LOCK TABLE players, matches IN SHARE ROW EXCLUSIVE MODE;
   SELECT * INTO s FROM live_drawing WHERE id = 1 FOR UPDATE;
-  IF action <> 'configure' AND jsonb_array_length(coalesce(s.pending_batch, '[]')) > 0 THEN
-    RAISE EXCEPTION 'Simpan seluruh hasil spin terlebih dahulu.';
-  END IF;
   IF action = 'configure' THEN
     cap := (payload->>'capacity')::integer;
     wc := (payload->>'wheel_count')::integer;
@@ -59,15 +34,14 @@ BEGIN
       -- Explicit primary-key predicates keep pg-safeupdate enabled.
       DELETE FROM matches WHERE id IS NOT NULL;
       UPDATE players SET name='', team_id=NULL, updated_at=now() WHERE slot IS NOT NULL;
-    ELSIF jsonb_array_length(s.pending_batch) > 0 OR s.pending IS NOT NULL
-      OR EXISTS (SELECT 1 FROM players WHERE coalesce(trim(name), '') <> '')
+    ELSIF EXISTS (SELECT 1 FROM players WHERE coalesce(trim(name), '') <> '')
       OR EXISTS (SELECT 1 FROM matches WHERE winner_slot IS NOT NULL OR (round > coalesce(8 - ceil(log(2, s.capacity))::integer, 1) AND (player1_slot IS NOT NULL OR player2_slot IS NOT NULL))) THEN
       RAISE EXCEPTION 'DRAWING_RESET_REQUIRED';
     END IF;
     SELECT coalesce(jsonb_agg(jsonb_build_object('id',gen_random_uuid()::text,'name',n) ORDER BY ordinal),'[]') INTO new_entries FROM jsonb_array_elements_text(payload->'names') WITH ORDINALITY AS x(n,ordinal);
     INSERT INTO live_drawing (id, capacity, wheel_count, initial_count, names, pending, retry_name, revision, spin_duration_ms, entries, retry_player_id) VALUES (1, cap, wc, jsonb_array_length(payload->'names'), payload->'names', NULL, NULL, coalesce(s.revision, 0) + 1, duration, new_entries, NULL)
     ON CONFLICT (id) DO UPDATE SET capacity = EXCLUDED.capacity, wheel_count = EXCLUDED.wheel_count,
-      names = EXCLUDED.names, initial_count = EXCLUDED.initial_count, pending = NULL, pending_batch = '[]', retry_name = NULL, revision = EXCLUDED.revision, spin_duration_ms = EXCLUDED.spin_duration_ms, entries=EXCLUDED.entries, retry_player_id=NULL;
+      names = EXCLUDED.names, initial_count = EXCLUDED.initial_count, pending = NULL, retry_name = NULL, revision = EXCLUDED.revision, spin_duration_ms = EXCLUDED.spin_duration_ms, entries=EXCLUDED.entries, retry_player_id=NULL;
     INSERT INTO players(slot, name) SELECT generate_series(1, cap), '' ON CONFLICT DO NOTHING;
     first_round := 8 - ceil(log(2, cap))::integer;
     size := power(2, 8 - first_round)::integer;
@@ -158,3 +132,5 @@ BEGIN
 END $$;
 REVOKE ALL ON FUNCTION public.live_drawing_action(jsonb) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.live_drawing_action(jsonb) TO service_role;
+
+COMMIT;

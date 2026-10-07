@@ -21,9 +21,10 @@ export async function GET() {
     const [state, players, teams] = await Promise.all([
       db.from('live_drawing').select('*').eq('id', 1).maybeSingle(),
       db.from('players').select('slot,name').order('slot'),
-      db.from('teams').select('id,name').order('name'),
+      db.from('teams').select('id,name,logo_url').order('name'),
     ]);
-    if (state.error || players.error || teams.error) throw new Error('Database Live Drawing belum siap. Jalankan migrations/001_live_drawing.sql.');
+    if (state.error || players.error || teams.error) throw new Error('Database Live Drawing belum siap. Jalankan migrations/001_live_drawing.sql lalu migrations/003_live_drawing_batch.sql.');
+    if (state.data && !Array.isArray(state.data.pending_batch)) throw new Error('Jalankan migrations/003_live_drawing_batch.sql di Supabase untuk mengaktifkan spin bareng.');
     return Response.json({ state: state.data, players: players.data, teams: teams.data }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (error) { return failure(error); }
 }
@@ -31,9 +32,18 @@ export async function POST(request: Request) {
   try {
     const db = await client();
     const body = await request.json();
-    const actions = ['configure', 'settings', 'add_names', 'change_player', 'spin', 'retry', 'save', 'move'];
+    const batchActions = ['spin_all', 'retry_one', 'batch_team', 'save_all'];
+    const actions = ['configure', 'settings', 'add_names', 'change_player', 'spin', 'retry', 'save', 'move', ...batchActions];
     if (!actions.includes(body.action)) throw new Error('Aksi tidak valid.');
     const payload = { ...body };
+    if (body.action === 'spin_all') {
+      if (!Array.isArray(body.selections) || !body.selections.length || body.selections.length > 128 ||
+        body.selections.some((selection: { wheel?: unknown; player_id?: unknown } | null) => !selection || !Number.isInteger(selection.wheel) || typeof selection.player_id !== 'string' || !selection.player_id.trim())) {
+        throw new Error('Pilih pemain untuk wheel yang akan diputar.');
+      }
+    }
+    if (['retry_one', 'batch_team'].includes(body.action) && (typeof body.player_id !== 'string' || !body.player_id)) throw new Error('Pilih hasil pemain.');
+    if (body.action === 'batch_team' && body.team_id !== null && (typeof body.team_id !== 'string' || !body.team_id.trim())) throw new Error('Pilih tim yang valid.');
     if (body.action === 'save') {
       if (typeof body.team_id !== 'string' || !body.team_id.trim()) throw new Error('Pilih tim sebelum menyimpan hasil drawing.');
       payload.team_id = body.team_id.trim();
@@ -56,11 +66,12 @@ export async function POST(request: Request) {
       if (!Number.isInteger(body.wheel_count) || body.wheel_count < 1 || body.wheel_count > body.capacity) throw new Error('Jumlah wheel tidak valid.');
       if (!payload.names.length || payload.names.length > body.capacity) throw new Error('Isi nama pemain sesuai kapasitas.');
     }
+    const functionName = batchActions.includes(body.action) ? 'live_drawing_batch_action' : 'live_drawing_action';
     if (!db) {
-      await localSql(`SELECT live_drawing_action(${sqlLiteral(JSON.stringify(payload))}::jsonb)`);
+      await localSql(`SELECT ${functionName}(${sqlLiteral(JSON.stringify(payload))}::jsonb)`);
     } else {
-      const { error } = await db.rpc('live_drawing_action', { payload });
-      if (error) throw new Error(error.message);
+      const { error } = await db.rpc(functionName, { payload });
+      if (error) throw new Error(error.code === 'PGRST202' ? 'Jalankan migrations/003_live_drawing_batch.sql di Supabase untuk mengaktifkan spin bareng.' : error.message);
     }
     return GET();
   } catch (error) { return failure(error); }
